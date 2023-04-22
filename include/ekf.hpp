@@ -1,7 +1,7 @@
 /**
- * @file ekf2.hpp
+ * @file ekf.hpp
  * @author Linfu Wei (ghowoght@qq.com)
- * @brief 
+ * @brief IMU & 里程计松组合(右乘模型)
  * @version 1.0
  * @date 2023-04-08
  * 
@@ -120,8 +120,10 @@ private:
     Eigen::Matrix<double, DIM, 1> delta_x_; // p v phi bg ba g
     MD_DIM Pmat_;
 
+    MD_DIM PHImat_;
     Eigen::Matrix<double, DIM, 12> Gmat_; // 噪声输入映射矩阵 noise-input mapping matrix
     Eigen::Matrix<double, DIM, 12> Gmat_last_;
+    Eigen::Matrix<double, 12, 12> qmat_;
 
     M3D Rmat_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> delta_z_;
@@ -134,9 +136,8 @@ public:
     IMUProcess()=default;
     IMUProcess(const ModelParam& model_param) : model_param_(model_param){
         state_last_ = StateEKF();
-        
+        // 误差状态置零        
         delta_x_.setZero();
-
         // 初始化P
         Pmat_.setIdentity();
         Pmat_(0,0) = Pmat_(1,1) = Pmat_(2,2) = 0.0;
@@ -144,6 +145,17 @@ public:
         Pmat_(6,6) = Pmat_(7,7) = Pmat_(8,8) = 1e-9;
         Pmat_(9,9) = Pmat_(10,10) = Pmat_(11,11) = 1e-9;
         Pmat_(12,12) = Pmat_(13,13) = Pmat_(14,14) = 1e-9;
+        // 初始化q
+        qmat_.setZero();
+        double item[] = {   model_param_.VRW * model_param_.VRW,
+                            model_param_.ARW * model_param_.ARW,
+                            2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
+                            2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
+                        };
+        for(int i = 0; i < 4; i++){
+            qmat_.block<3, 3>(3 * i,  3 * i) = item[i] * M3D::Identity();
+        }
+
         // 初始化R
         Rmat_ = model_param_.odom_std
                 .cwiseProduct(model_param_.odom_std)
@@ -154,7 +166,7 @@ public:
         // 初始化安装角矩阵
         model_param_.init_r_b_v(model_param_.imu_mount_angle);
         
-        fw_ptr_ = FileWriter::create("/home/ghowoght/workspace/ekf/result/result_ekf2.txt");
+        fw_ptr_ = FileWriter::create("/home/ghowoght/workspace/ekf_plus/result/result_ekf2.txt");
     }
     ~IMUProcess()=default;
 
@@ -186,48 +198,36 @@ private:
             //////////////// 噪声传播 ////////////////
             const M3D I_33 = M3D::Identity();
             // 计算状态转移矩阵Φ
-            MD_DIM PHImat;
-            PHImat.setIdentity();
+            PHImat_.setIdentity();
             // p
-            PHImat.block<3, 3>(0,  3) = I_33 * dt;  
+            PHImat_.block<3, 3>(0,  3) = I_33 * dt;  
             // v
-            PHImat.block<3, 3>(3,  6) = -(state_curr.rot * SO3Math::get_skew_symmetric(imu.accel_mpss * dt)); 
-            PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
+            PHImat_.block<3, 3>(3,  6) = -(state_curr.rot * SO3Math::get_skew_symmetric(imu.accel_mpss * dt)); 
+            PHImat_.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
             // phi
-            PHImat.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
-            PHImat.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
-            // PHImat.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt);  // 近似
-            // PHImat.block<3, 3>(6,  9) = -I_33 * dt;                                              // 近似
+            // PHImat_.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
+            // PHImat_.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
+            PHImat_.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt);  // 近似
+            PHImat_.block<3, 3>(6,  9) = -I_33 * dt;                                              // 近似
 
-            PHImat.block<3, 3>(9, 9) = (1 - dt / model_param_.gyro_bias_corr_time) * I_33;
-            PHImat.block<3, 3>(12, 12) = (1 - dt / model_param_.accel_bias_corr_time) * I_33;
+            PHImat_.block<3, 3>(9, 9) = (1 - dt / model_param_.gyro_bias_corr_time) * I_33;
+            PHImat_.block<3, 3>(12, 12) = (1 - dt / model_param_.accel_bias_corr_time) * I_33;
 
             // 计算状态转移噪声协方差矩阵Q
-            Eigen::Matrix<double, 12, 12> qmat;
-            qmat.setZero();
-            double item[] = {   model_param_.VRW * model_param_.VRW,
-                                model_param_.ARW * model_param_.ARW,
-                                2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
-                                2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
-                            };
-            for(int i = 0; i < 4; i++){
-                qmat.block<3, 3>(3 * i,  3 * i) = item[i] * M3D::Identity();
-            }
             Gmat_.setZero();
-
-            // 梯形积分
-            Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix();
-            Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose();
-            // Gmat_.block<3, 3>( 3, 0) = -I_33; // 近似
-            // Gmat_.block<3, 3>( 6, 3) = -I_33; // 近似
+            // Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix();
+            // Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose();
+            Gmat_.block<3, 3>( 3, 0) = -I_33; // 近似
+            Gmat_.block<3, 3>( 6, 3) = -I_33; // 近似
             Gmat_.block<3, 3>( 9, 6) = I_33;
             Gmat_.block<3, 3>(12, 9) = I_33;
+            // 梯形积分
             MD_DIM Qmat = 
-                0.5 * dt * (PHImat * Gmat_ * qmat * Gmat_.transpose() + Gmat_ * qmat * Gmat_.transpose() * PHImat.transpose());
+                0.5 * dt * (PHImat_ * Gmat_ * qmat_ * Gmat_.transpose() 
+                + Gmat_ * qmat_ * Gmat_.transpose() * PHImat_.transpose());
 
             // 状态转移
-            MD_DIM P_ = PHImat * Pmat_ * PHImat.transpose() + Qmat;
-            Pmat_ = P_;
+            Pmat_ = PHImat_ * Pmat_ * PHImat_.transpose() + Qmat;
         }
     }
 
@@ -253,19 +253,18 @@ private:
         Hmat.block<3, 3>(0, 6) = r_b_n * r_v_b * SO3Math::get_skew_symmetric(lodom.cross(gyro_rps));
         Hmat.block<3, 3>(0, 9) = r_b_n * r_v_b * SO3Math::get_skew_symmetric(lodom);
 
-        V3D z_k(ave_vel, 0, 0);
+        V3D vel_v(ave_vel, 0, 0); // v系速度观测
         // 新息
-        V3D delta_z = r_b_n * r_v_b * z_k - 
+        V3D delta_z = r_b_n * r_v_b * vel_v - 
                     (state_curr.vel - r_b_n * r_v_b * lodom.cross(gyro_rps));
-        // std::cout << "z_k: " << z_k[0] << " delta_z: " << delta_z.transpose() << std::endl;
 
         // 卡尔曼增益
         Eigen::Matrix<double, DIM, 3> Kmat = Pmat_ * Hmat.transpose() 
                             * (Hmat * Pmat_ * Hmat.transpose() 
                             + Rmat_).inverse();
-                            
-        // 更新状态
+        // 更新误差状态
         delta_x_ = Kmat * (delta_z - Hmat * delta_x_);
+        // 状态反馈
         state_curr.pos += delta_x_.block<3, 1>(0, 0);
         state_curr.vel += delta_x_.block<3, 1>(3, 0);
         state_curr.rot = state_curr.rot * SO3Math::Exp(delta_x_.block<3, 1>(6, 0));
@@ -284,7 +283,7 @@ private:
     
 public:
     bool init_imu(MeasureData& measure){
-        const int imu_buffer_size = 1000;
+        const int imu_buffer_size = 100;
         static int cnt = 0;
         static bool init_flag = false;
         static std::vector<ImuData> imu_queue;
@@ -303,7 +302,8 @@ public:
             const V3D accel = state_last_.ba / (double)cnt;
             
             // 轴线转换为旋转矩阵
-            auto axis_to_matrix = [](const V3D& axis, M3D& R){
+            auto axis_to_matrix = [](const V3D& axis){
+                M3D R;
                 R.col(0) = V3D(1, 0, 0);
                 R.col(1) = V3D(0, 1, 0);
                 R.col(2) = -axis;
@@ -312,33 +312,17 @@ public:
                 R.col(1) -= R.col(1).dot(R.col(2)) / R.col(2).dot(R.col(2)) * R.col(2);
                 R.col(1) -= R.col(1).dot(R.col(0)) / R.col(0).dot(R.col(0)) * R.col(0);
                 R.col(1).normalize();
+                return R;
             };
-            auto accel_normed = accel / accel.norm();
-            M3D R;
-            axis_to_matrix(accel_normed, R);
+            // 使用归一化的加速度计测量值作为重力方向
+            M3D R = axis_to_matrix(accel / accel.norm());
             state_last_.rot = R.transpose();
             state_last_.ba = accel - state_last_.rot.conjugate() * grav;
 
             std::cout << "bg: " << state_last_.bg.transpose() << std::endl;
             std::cout << "ba: " << state_last_.ba.transpose() << std::endl;
 
-            V3D bias = state_last_.rot * (accel - state_last_.ba) - grav;
             init_flag = true;
-            std::cout << "bias: " << bias.transpose() << std::endl;
-
-            // 求imu观测方差
-            V3D var_accel = V3D::Zero();
-            V3D var_gyro = V3D::Zero();
-            for(auto& imu : imu_queue){
-                var_accel += imu.accel_mpss.cwiseProduct(state_last_.rot * (imu.accel_mpss - state_last_.ba) - grav);
-                var_gyro += imu.gyro_rps.cwiseProduct(imu.gyro_rps - state_last_.bg);
-            }
-            var_accel /= (double)cnt;
-            var_gyro /= (double)cnt;
-            std::cout << "var_accel: " << var_accel.transpose() << std::endl;
-            std::cout << "var_gyro: " << var_gyro.transpose() << std::endl;
-            var_accel = var_accel.cwiseSqrt() * 1e5;
-            var_gyro = var_gyro.cwiseSqrt() * SO3Math::R2D * 3600;
         }
         return init_flag;
     }
@@ -368,14 +352,10 @@ public:
         ss << std::fixed << std::setprecision(9) << state_last_.pos.x() << " ";
         ss << std::fixed << std::setprecision(9) << state_last_.pos.y() << " ";
         ss << std::fixed << std::setprecision(9) << state_last_.pos.z() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.vel.x() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.vel.y() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.vel.z() << " ";
-        // 四元数转欧拉角
-        V3D euler = SO3Math::quat2euler(state_last_.rot);
-        ss << std::fixed << std::setprecision(9) << euler.x() * SO3Math::R2D << " ";
-        ss << std::fixed << std::setprecision(9) << euler.y() * SO3Math::R2D << " ";
-        ss << std::fixed << std::setprecision(9) << euler.z() * SO3Math::R2D << " ";
+        ss << std::fixed << std::setprecision(9) << state_last_.rot.x() << " ";
+        ss << std::fixed << std::setprecision(9) << state_last_.rot.y() << " ";
+        ss << std::fixed << std::setprecision(9) << state_last_.rot.z() << " ";
+        ss << std::fixed << std::setprecision(9) << state_last_.rot.w() << " ";
         ss << std::endl;
         fw_ptr_->write_txt(ss.str());
     }

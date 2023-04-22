@@ -23,11 +23,10 @@ int main(int argc, char **argv) {
     model_param.accel_bias_std       = 200 * 1e-5; // mGal 1mGal=1e-5m/s^2
     model_param.accel_bias_corr_time = 1 * 3600.0;
 
-    model_param.odom_std << 0.03, 0.05, 0.05; // odom观测噪声标准差
-
-    model_param.odom_lever_arm << 0, 0, 1.099; // m
-    model_param.imu_mount_angle << 0, 0.3, 0.31; // roll, pitch, yaw (deg)
-    model_param.imu_mount_angle *= SO3Math::D2R;
+    model_param.odom_std << 0.03, 0.05, 0.05;       // odom观测噪声标准差
+    model_param.odom_lever_arm << 0, 0, 1.099;      // m
+    model_param.imu_mount_angle << 0, 0.3, 0.31;    // roll, pitch, yaw (deg)
+    model_param.imu_mount_angle *= SO3Math::D2R;    // 转换为弧度
 
     IMUProcess imu_process(model_param);
 
