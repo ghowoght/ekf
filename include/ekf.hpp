@@ -26,19 +26,18 @@
 
 using V3D = Eigen::Vector3d;
 using M3D = Eigen::Matrix3d;
-using QD = Eigen::Quaterniond;
 using MD_DIM = Eigen::Matrix<double, DIM, DIM>;
 
 struct StateEKF{
     double time;
-    QD rot;
+    M3D rot;
     V3D pos;
     V3D vel;
     V3D bg;
     V3D ba;
     StateEKF(){
         time = 0;
-        rot = QD::Identity();
+        rot = M3D::Identity();
         pos = V3D::Zero();
         vel = V3D::Zero();
         bg = V3D::Zero();
@@ -95,9 +94,8 @@ struct ModelParam{
     double ARW;                             // 角度随机游走
     double VRW;                             // 速度随机游走
     double gyro_bias_std;                   // 陀螺仪零偏标准差
-    double gyro_bias_corr_time;             // 陀螺仪零偏相关时间
     double accel_bias_std;                  // 加速度计零偏标准差
-    double accel_bias_corr_time;            // 加速度计零偏相关时间
+    double corr_time;                       // 零偏相关时间
     V3D odom_std;                           // odom观测噪声
     V3D odom_lever_arm;                     // odom安装杆臂
     V3D imu_mount_angle;                    // IMU安装角度
@@ -122,7 +120,6 @@ private:
 
     MD_DIM PHImat_;
     Eigen::Matrix<double, DIM, 12> Gmat_; // 噪声输入映射矩阵 noise-input mapping matrix
-    Eigen::Matrix<double, DIM, 12> Gmat_last_;
     Eigen::Matrix<double, 12, 12> qmat_;
 
     M3D Rmat_;
@@ -149,8 +146,8 @@ public:
         qmat_.setZero();
         double item[] = {   model_param_.VRW * model_param_.VRW,
                             model_param_.ARW * model_param_.ARW,
-                            2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
-                            2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
+                            2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.corr_time,
+                            2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.corr_time,
                         };
         for(int i = 0; i < 4; i++){
             qmat_.block<3, 3>(3 * i,  3 * i) = item[i] * M3D::Identity();
@@ -187,7 +184,6 @@ private:
             //////////////// 机械编排 ////////////////
             // 姿态更新
             state_curr.rot = state_curr.rot * SO3Math::Exp(imu.gyro_rps * dt);
-            state_curr.rot.normalize();
             // 速度更新
             state_curr.vel += (state_curr.rot * imu.accel_mpss - grav) * dt;
             // 位置更新
@@ -203,15 +199,15 @@ private:
             PHImat_.block<3, 3>(0,  3) = I_33 * dt;  
             // v
             PHImat_.block<3, 3>(3,  6) = -(state_curr.rot * SO3Math::get_skew_symmetric(imu.accel_mpss * dt)); 
-            PHImat_.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
+            PHImat_.block<3, 3>(3, 12) = -state_curr.rot * dt;
             // phi
             // PHImat_.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
             // PHImat_.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
             PHImat_.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt);  // 近似
             PHImat_.block<3, 3>(6,  9) = -I_33 * dt;                                              // 近似
 
-            PHImat_.block<3, 3>(9, 9) = (1 - dt / model_param_.gyro_bias_corr_time) * I_33;
-            PHImat_.block<3, 3>(12, 12) = (1 - dt / model_param_.accel_bias_corr_time) * I_33;
+            PHImat_.block<3, 3>(9, 9) = (1 - dt / model_param_.corr_time) * I_33;
+            PHImat_.block<3, 3>(12, 12) = (1 - dt / model_param_.corr_time) * I_33;
 
             // 计算状态转移噪声协方差矩阵Q
             Gmat_.setZero();
@@ -244,19 +240,19 @@ private:
 
         const M3D   r_v_b       = model_param_.r_b_v.transpose();
         const V3D&  lodom       = model_param_.odom_lever_arm;
-        const QD&   r_b_n       = state_curr.rot;
+        const M3D&   r_b_n       = state_curr.rot;
         const V3D&  gyro_rps    = measure.imu_queue.back().gyro_rps;
         // 计算观测矩阵H
         Eigen::Matrix<double, 3, DIM> Hmat;
         Hmat.setZero();
         Hmat.block<3, 3>(0, 3) = M3D::Identity();
-        Hmat.block<3, 3>(0, 6) = r_b_n * r_v_b * SO3Math::get_skew_symmetric(lodom.cross(gyro_rps));
-        Hmat.block<3, 3>(0, 9) = r_b_n * r_v_b * SO3Math::get_skew_symmetric(lodom);
+        Hmat.block<3, 3>(0, 6) = r_b_n * SO3Math::get_skew_symmetric(lodom.cross(gyro_rps));
+        Hmat.block<3, 3>(0, 9) = r_b_n * SO3Math::get_skew_symmetric(lodom);
 
         V3D vel_v(ave_vel, 0, 0); // v系速度观测
         // 新息
         V3D delta_z = r_b_n * r_v_b * vel_v - 
-                    (state_curr.vel - r_b_n * r_v_b * lodom.cross(gyro_rps));
+                    (state_curr.vel - r_b_n * lodom.cross(gyro_rps));
 
         // 卡尔曼增益
         Eigen::Matrix<double, DIM, 3> Kmat = Pmat_ * Hmat.transpose() 
@@ -268,7 +264,6 @@ private:
         state_curr.pos += delta_x_.block<3, 1>(0, 0);
         state_curr.vel += delta_x_.block<3, 1>(3, 0);
         state_curr.rot = state_curr.rot * SO3Math::Exp(delta_x_.block<3, 1>(6, 0));
-        state_curr.rot.normalize();
         state_curr.bg += delta_x_.block<3, 1>(9, 0);
         state_curr.ba += delta_x_.block<3, 1>(12, 0);
 
@@ -317,7 +312,7 @@ public:
             // 使用归一化的加速度计测量值作为重力方向
             M3D R = axis_to_matrix(accel / accel.norm());
             state_last_.rot = R.transpose();
-            state_last_.ba = accel - state_last_.rot.conjugate() * grav;
+            state_last_.ba = accel - state_last_.rot.transpose() * grav;
 
             std::cout << "bg: " << state_last_.bg.transpose() << std::endl;
             std::cout << "ba: " << state_last_.ba.transpose() << std::endl;
@@ -352,12 +347,19 @@ public:
         ss << std::fixed << std::setprecision(9) << state_last_.pos.x() << " ";
         ss << std::fixed << std::setprecision(9) << state_last_.pos.y() << " ";
         ss << std::fixed << std::setprecision(9) << state_last_.pos.z() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.rot.x() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.rot.y() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.rot.z() << " ";
-        ss << std::fixed << std::setprecision(9) << state_last_.rot.w() << " ";
+        Eigen::Quaterniond q(state_last_.rot);
+        ss << std::fixed << std::setprecision(9) << q.x() << " ";
+        ss << std::fixed << std::setprecision(9) << q.y() << " ";
+        ss << std::fixed << std::setprecision(9) << q.z() << " ";
+        ss << std::fixed << std::setprecision(9) << q.w() << " ";
         ss << std::endl;
         fw_ptr_->write_txt(ss.str());
+
+        // for(auto& state : state_queue_){
+        //     std::cout << "time: " << state.time << " ";
+        //     std::cout << "pos: " << state.pos.transpose() << " ";
+        //     std::cout << std::endl;
+        // }
     }
 };
 
