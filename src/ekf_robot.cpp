@@ -19,9 +19,8 @@ int main(int argc, char **argv) {
     model_param.ARW                  = 0.1 / 60.0 * SO3Math::D2R;  // deg/sqrt(hr)
     model_param.VRW                  = 0.1 / 60.0;        // m/s/sqrt(hr)
     model_param.gyro_bias_std        = 50 * SO3Math::D2R / 3600.0; // deg/hr
-    model_param.gyro_bias_corr_time  = 1 * 3600.0;
     model_param.accel_bias_std       = 200 * 1e-5; // mGal 1mGal=1e-5m/s^2
-    model_param.accel_bias_corr_time = 1 * 3600.0;
+    model_param.corr_time            = 1 * 3600.0;
 
     model_param.odom_std << 0.03, 0.05, 0.05;       // odom观测噪声标准差
     model_param.odom_lever_arm << 0, 0, 1.099;      // m
@@ -52,7 +51,7 @@ int main(int argc, char **argv) {
 
         measure.imu_queue.push_back(imudata);
         measure.odom_queue.push_back(odomdata);
-        
+
         if(imudata.time - last_time > 0.1)
         {
             last_time = imudata.time;
